@@ -35,6 +35,7 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
 const ATEMPO_URL = process.env.ATEMPO_URL || "https://atempo-pc0w.onrender.com";
+const INTERNAL_KEY = process.env.ATEMPO_INTERNAL_KEY || "";
 const AUTH_DIR = path.join(__dirname, "auth");
 
 const log = pino({ level: "info", transport: undefined });
@@ -160,9 +161,11 @@ async function handleIncoming(salonId, sock, m) {
   // Indicador "a escrever..." enquanto a IA pensa — toque humano
   try { await sock.sendPresenceUpdate("composing", remoteJid); } catch {}
 
+  const headers = { "Content-Type": "application/json" };
+  if (INTERNAL_KEY) headers["X-Internal-Key"] = INTERNAL_KEY;
   const res = await fetch(`${ATEMPO_URL}/v1/messages/incoming`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       salonId,
       contactName,
@@ -213,7 +216,20 @@ app.use((_, res, next) => {
   next();
 });
 
+// Middleware — protege todos os endpoints excepto /health
+function requireInternal(req, res, next) {
+  if (!INTERNAL_KEY) return next();  // legacy mode
+  const key = req.header("x-internal-key");
+  if (!key || key !== INTERNAL_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
 app.get("/health", (_, res) => res.json({ ok: true, sessions: sessions.size }));
+
+// Tudo abaixo exige X-Internal-Key (se configurada)
+app.use(requireInternal);
 
 /** Cria/recupera sessão e devolve QR (se ainda não autenticada). */
 app.get("/qr", async (req, res) => {
