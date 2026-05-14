@@ -1,0 +1,20 @@
+{
+  "name": "atempo-baileys",
+  "version": "1.0.0",
+  "description": "ATEMPO WhatsApp gateway — Baileys bridge to Python server",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.21.1",
+    "node-fetch": "^3.3.2",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}

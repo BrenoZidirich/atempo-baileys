@@ -1,0 +1,302 @@
+/**
+ * ATEMPO Baileys Gateway
+ * ─────────────────────────────────────────────────────────
+ * Pontes entre o WhatsApp e o servidor Python do ATEMPO.
+ *
+ * Fluxo:
+ *   1. Dona abre dashboard no iPhone → GET /qr?salonId=X
+ *   2. Página mostra QR code → ela escaneia pelo WhatsApp do iPhone
+ *   3. Sessão Baileys autenticada → recebe mensagens em tempo real
+ *   4. Para cada mensagem nova:
+ *        a. POST → ATEMPO Python /v1/messages/incoming
+ *        b. Python responde com texto da IA
+ *        c. Baileys envia para o WhatsApp da cliente
+ *
+ * Multi-tenant: cada salão tem a sua pasta auth/{salonId}/ com
+ * as credenciais. Reconecta sozinho após reboot.
+ *
+ * Dependências mínimas — corre em qualquer Render free tier.
+ */
+
+import express from "express";
+import QRCode from "qrcode";
+import pino from "pino";
+import fetch from "node-fetch";
+import {
+  default as makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} from "@whiskeysockets/baileys";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.PORT || 3001;
+const ATEMPO_URL = process.env.ATEMPO_URL || "https://atempo-pc0w.onrender.com";
+const AUTH_DIR = path.join(__dirname, "auth");
+
+const log = pino({ level: "info", transport: undefined });
+
+// Sessões activas por salonId.
+//   { sock: WASocket, qrDataUrl: string|null, status: "qr"|"connecting"|"open"|"closed" }
+const sessions = new Map();
+
+// ─────────────────────────────────────────────────────────
+// Baileys session lifecycle
+// ─────────────────────────────────────────────────────────
+
+async function startSession(salonId) {
+  if (sessions.has(salonId)) {
+    const existing = sessions.get(salonId);
+    if (existing.status === "open" || existing.status === "connecting") {
+      return existing;
+    }
+  }
+
+  const sessionDir = path.join(AUTH_DIR, salonId);
+  fs.mkdirSync(sessionDir, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: pino({ level: "silent" }),
+    browser: ["ATEMPO", "Chrome", "1.0"],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+  });
+
+  const session = {
+    sock,
+    qrDataUrl: null,
+    status: "connecting",
+    connectedAt: null,
+    lastError: null,
+  };
+  sessions.set(salonId, session);
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      session.qrDataUrl = await QRCode.toDataURL(qr, {
+        margin: 2,
+        width: 300,
+        color: { dark: "#0A0A0A", light: "#F5F1EA" },
+      });
+      session.status = "qr";
+      log.info(`[${salonId}] QR code gerado`);
+    }
+
+    if (connection === "open") {
+      session.status = "open";
+      session.qrDataUrl = null;
+      session.connectedAt = new Date().toISOString();
+      log.info(`[${salonId}] ✅ ligado ao WhatsApp`);
+    }
+
+    if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode
+                  ?? lastDisconnect?.error?.statusCode
+                  ?? null;
+      const shouldReconnect = reason !== DisconnectReason.loggedOut;
+      session.status = "closed";
+      session.lastError = reason;
+      log.warn(`[${salonId}] desligado (reason=${reason}, reconnect=${shouldReconnect})`);
+      sessions.delete(salonId);
+      if (shouldReconnect) {
+        setTimeout(() => startSession(salonId), 3000);
+      } else {
+        // Logged out — limpa credenciais para forçar novo QR
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const m of messages) {
+      try {
+        await handleIncoming(salonId, sock, m);
+      } catch (e) {
+        log.error({ err: e.message }, `[${salonId}] handleIncoming failed`);
+      }
+    }
+  });
+
+  return session;
+}
+
+// ─────────────────────────────────────────────────────────
+// Mensagem recebida → ATEMPO Python → resposta
+// ─────────────────────────────────────────────────────────
+
+async function handleIncoming(salonId, sock, m) {
+  // Ignora as nossas próprias mensagens e grupos
+  if (m.key.fromMe) return;
+  if (m.key.remoteJid?.endsWith("@g.us")) return;
+
+  const text =
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    m.message?.videoMessage?.caption ||
+    null;
+
+  if (!text || !text.trim()) return;
+
+  const remoteJid = m.key.remoteJid;
+  const contactName = m.pushName || remoteJid.split("@")[0];
+
+  log.info(`[${salonId}] 📨 ${contactName}: ${text}`);
+
+  // Indicador "a escrever..." enquanto a IA pensa — toque humano
+  try { await sock.sendPresenceUpdate("composing", remoteJid); } catch {}
+
+  const res = await fetch(`${ATEMPO_URL}/v1/messages/incoming`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      salonId,
+      contactName,
+      text,
+      timestamp: Math.floor(Date.now() / 1000),
+    }),
+  });
+
+  if (!res.ok) {
+    log.error(`[${salonId}] ATEMPO respondeu ${res.status}`);
+    try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
+    return;
+  }
+
+  const data = await res.json();
+  const reply = data.reply;
+
+  if (data.pending) {
+    log.info(`[${salonId}] ⏸ pending approval — não envia`);
+    try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
+    return;
+  }
+
+  if (!reply || !reply.trim()) {
+    try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
+    return;
+  }
+
+  // Delay humano (0.8s + ~30ms por caractere, máx 6s) — sente-se como pessoa
+  const typingDelay = Math.min(800 + reply.length * 30, 6000);
+  await new Promise((r) => setTimeout(r, typingDelay));
+
+  try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
+  await sock.sendMessage(remoteJid, { text: reply });
+  log.info(`[${salonId}] ✉️ enviado: ${reply.slice(0, 60)}…`);
+}
+
+// ─────────────────────────────────────────────────────────
+// HTTP API
+// ─────────────────────────────────────────────────────────
+
+const app = express();
+app.use(express.json());
+app.use((_, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
+
+app.get("/health", (_, res) => res.json({ ok: true, sessions: sessions.size }));
+
+/** Cria/recupera sessão e devolve QR (se ainda não autenticada). */
+app.get("/qr", async (req, res) => {
+  const salonId = req.query.salonId || "default";
+  let session = sessions.get(salonId);
+  if (!session) {
+    session = await startSession(salonId);
+  }
+  // Pequeno wait para o QR ser gerado se for primeira vez
+  for (let i = 0; i < 20 && !session.qrDataUrl && session.status !== "open"; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  res.json({
+    salonId,
+    status: session.status,
+    qr: session.qrDataUrl,
+    connectedAt: session.connectedAt,
+  });
+});
+
+/** Estado actual sem gerar QR. */
+app.get("/status", (req, res) => {
+  const salonId = req.query.salonId || "default";
+  const session = sessions.get(salonId);
+  if (!session) return res.json({ salonId, status: "not_started" });
+  res.json({
+    salonId,
+    status: session.status,
+    connectedAt: session.connectedAt,
+    hasQr: !!session.qrDataUrl,
+  });
+});
+
+/** Desliga sessão (logout completo — exige novo QR para reactivar). */
+app.post("/logout", async (req, res) => {
+  const salonId = req.query.salonId || req.body?.salonId || "default";
+  const session = sessions.get(salonId);
+  if (!session) return res.json({ ok: false, error: "no_session" });
+  try {
+    await session.sock.logout();
+  } catch {}
+  sessions.delete(salonId);
+  const dir = path.join(AUTH_DIR, salonId);
+  fs.rmSync(dir, { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+/** Envia mensagem manualmente (útil para o dashboard fazer takeover). */
+app.post("/send", async (req, res) => {
+  const { salonId = "default", to, text } = req.body || {};
+  const session = sessions.get(salonId);
+  if (!session || session.status !== "open") {
+    return res.status(400).json({ ok: false, error: "not_connected" });
+  }
+  try {
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    await session.sock.sendMessage(jid, { text });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────
+// Boot — restaura sessões já autenticadas
+// ─────────────────────────────────────────────────────────
+
+async function restoreSavedSessions() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  const dirs = fs.readdirSync(AUTH_DIR).filter((d) => {
+    const full = path.join(AUTH_DIR, d);
+    return fs.statSync(full).isDirectory() && fs.existsSync(path.join(full, "creds.json"));
+  });
+  for (const salonId of dirs) {
+    log.info(`a restaurar sessão: ${salonId}`);
+    startSession(salonId).catch((e) =>
+      log.error({ err: e.message }, `restore failed: ${salonId}`)
+    );
+  }
+}
+
+app.listen(PORT, async () => {
+  log.info(`ATEMPO Baileys gateway → port ${PORT}`);
+  log.info(`ATEMPO_URL = ${ATEMPO_URL}`);
+  await restoreSavedSessions();
+});

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: atempo-baileys
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: ATEMPO_URL
+        value: https://atempo-pc0w.onrender.com
+      - key: NODE_VERSION
+        value: "20"
+    disk:
+      name: baileys-auth
+      mountPath: /opt/render/project/src/auth
+      sizeGB: 1
