@@ -78,6 +78,9 @@ async function startSession(salonId) {
     status: "connecting",
     connectedAt: null,
     lastError: null,
+    // IDs de mensagens que o BOT enviou — para não as confundir com a voz do
+    // dono quando reaparecem em messages.upsert como fromMe.
+    botSentIds: new Set(),
   };
   sessions.set(salonId, session);
 
@@ -125,9 +128,15 @@ async function startSession(salonId) {
     if (type !== "notify") return;
     for (const m of messages) {
       try {
-        await handleIncoming(salonId, sock, m);
+        if (m.key.fromMe) {
+          // Mensagem enviada pela conta do dono — pode ser ele a escrever
+          // (voz a aprender) ou o próprio bot (a ignorar).
+          await handleOwnerOutgoing(salonId, session, m);
+        } else {
+          await handleIncoming(salonId, session, m);
+        }
       } catch (e) {
-        log.error({ err: e.message }, `[${salonId}] handleIncoming failed`);
+        log.error({ err: e.message }, `[${salonId}] upsert failed`);
       }
     }
   });
@@ -139,7 +148,8 @@ async function startSession(salonId) {
 // Mensagem recebida → ATEMPO Python → resposta
 // ─────────────────────────────────────────────────────────
 
-async function handleIncoming(salonId, sock, m) {
+async function handleIncoming(salonId, session, m) {
+  const sock = session.sock;
   // Ignora as nossas próprias mensagens e grupos
   if (m.key.fromMe) return;
   if (m.key.remoteJid?.endsWith("@g.us")) return;
@@ -199,8 +209,49 @@ async function handleIncoming(salonId, sock, m) {
   await new Promise((r) => setTimeout(r, typingDelay));
 
   try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
-  await sock.sendMessage(remoteJid, { text: reply });
+  const sent = await sock.sendMessage(remoteJid, { text: reply });
+  // Marca este id como "foi o bot" para o handleOwnerOutgoing o ignorar quando
+  // reaparecer como fromMe (senão a assistente aprenderia consigo própria).
+  if (sent?.key?.id) {
+    session.botSentIds.add(sent.key.id);
+    if (session.botSentIds.size > 500) session.botSentIds.clear();
+  }
   log.info(`[${salonId}] ✉️ enviado: ${reply.slice(0, 60)}…`);
+}
+
+// ─────────────────────────────────────────────────────────
+// Mensagem do PRÓPRIO dono → ATEMPO Python (aprender a voz)
+// ─────────────────────────────────────────────────────────
+
+async function handleOwnerOutgoing(salonId, session, m) {
+  if (m.key.remoteJid?.endsWith("@g.us")) return;  // ignora grupos
+  const id = m.key.id;
+  if (id && session.botSentIds.has(id)) {           // foi o bot, não o dono
+    session.botSentIds.delete(id);
+    return;
+  }
+  const text =
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    null;
+  if (!text || !text.trim()) return;
+
+  const headers = { "Content-Type": "application/json" };
+  if (INTERNAL_KEY) headers["X-Internal-Key"] = INTERNAL_KEY;
+  try {
+    await fetch(`${ATEMPO_URL}/v1/messages/outgoing`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        salonId,
+        text: text.trim(),
+        contactName: m.pushName || "",
+        timestamp: Math.floor(Date.now() / 1000),
+      }),
+    });
+  } catch (e) {
+    log.warn(`[${salonId}] captura de voz falhou: ${e.message}`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────
