@@ -27,6 +27,7 @@ import {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadContentFromMessage,
 } from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
@@ -161,12 +162,28 @@ async function handleIncoming(salonId, session, m) {
     m.message?.videoMessage?.caption ||
     null;
 
-  if (!text || !text.trim()) return;
+  // Nota de voz: descarrega o áudio para o ATEMPO transcrever (Whisper).
+  let audioBase64 = null, audioMime = null;
+  const audioMsg = m.message?.audioMessage;
+  if ((!text || !text.trim()) && audioMsg) {
+    try {
+      const stream = await downloadContentFromMessage(audioMsg, "audio");
+      let buf = Buffer.from([]);
+      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+      audioBase64 = buf.toString("base64");
+      audioMime = audioMsg.mimetype || "audio/ogg";
+      log.info(`[${salonId}] 🎤 nota de voz recebida (${buf.length} bytes)`);
+    } catch (e) {
+      log.warn(`[${salonId}] falha a descarregar áudio: ${e.message}`);
+    }
+  }
+
+  if ((!text || !text.trim()) && !audioBase64) return;  // nada de útil
 
   const remoteJid = m.key.remoteJid;
   const contactName = m.pushName || remoteJid.split("@")[0];
 
-  log.info(`[${salonId}] 📨 ${contactName}: ${text}`);
+  log.info(`[${salonId}] 📨 ${contactName}: ${text || "[áudio]"}`);
 
   // Indicador "a escrever..." enquanto a IA pensa — toque humano
   try { await sock.sendPresenceUpdate("composing", remoteJid); } catch {}
@@ -180,7 +197,9 @@ async function handleIncoming(salonId, session, m) {
       salonId,
       contactName,
       contactJid: remoteJid,
-      text,
+      text: text || "",
+      audioBase64,
+      audioMime,
       timestamp: Math.floor(Date.now() / 1000),
     }),
   });
@@ -207,17 +226,31 @@ async function handleIncoming(salonId, session, m) {
 
   // Delay humano (0.8s + ~30ms por caractere, máx 6s) — sente-se como pessoa
   const typingDelay = Math.min(800 + reply.length * 30, 6000);
+  if (data.audioReplyBase64) {
+    try { await sock.sendPresenceUpdate("recording", remoteJid); } catch {}
+  }
   await new Promise((r) => setTimeout(r, typingDelay));
 
   try { await sock.sendPresenceUpdate("paused", remoteJid); } catch {}
-  const sent = await sock.sendMessage(remoteJid, { text: reply });
+
+  let sent;
+  if (data.audioReplyBase64) {
+    // Responde com nota de voz (ogg/opus do TTS) — espelha o áudio do cliente
+    const audioBuf = Buffer.from(data.audioReplyBase64, "base64");
+    sent = await sock.sendMessage(remoteJid, {
+      audio: audioBuf, ptt: true, mimetype: "audio/ogg; codecs=opus",
+    });
+    log.info(`[${salonId}] 🔊 resposta em áudio enviada (${audioBuf.length} bytes)`);
+  } else {
+    sent = await sock.sendMessage(remoteJid, { text: reply });
+    log.info(`[${salonId}] ✉️ enviado: ${reply.slice(0, 60)}…`);
+  }
   // Marca este id como "foi o bot" para o handleOwnerOutgoing o ignorar quando
   // reaparecer como fromMe (senão a assistente aprenderia consigo própria).
   if (sent?.key?.id) {
     session.botSentIds.add(sent.key.id);
     if (session.botSentIds.size > 500) session.botSentIds.clear();
   }
-  log.info(`[${salonId}] ✉️ enviado: ${reply.slice(0, 60)}…`);
 }
 
 // ─────────────────────────────────────────────────────────
