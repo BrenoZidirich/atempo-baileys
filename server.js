@@ -377,7 +377,16 @@ app.post("/send", async (req, res) => {
     return res.status(400).json({ ok: false, error: "not_connected" });
   }
   try {
-    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    // "self" → o próprio número (notificação "Mensagem para mim" da gestora).
+    let jid;
+    if (to === "self") {
+      const me = session.sock.user?.id || "";
+      const num = me.split(":")[0].split("@")[0];
+      if (!num) return res.status(400).json({ ok: false, error: "no_self_jid" });
+      jid = `${num}@s.whatsapp.net`;
+    } else {
+      jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    }
     await session.sock.sendMessage(jid, { text });
     res.json({ ok: true });
   } catch (e) {
