@@ -179,6 +179,7 @@ async function handleIncoming(salonId, session, m) {
     body: JSON.stringify({
       salonId,
       contactName,
+      contactJid: remoteJid,
       text,
       timestamp: Math.floor(Date.now() / 1000),
     }),
