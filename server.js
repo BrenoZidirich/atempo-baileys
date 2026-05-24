@@ -151,9 +151,16 @@ async function startSession(salonId) {
 
 async function handleIncoming(salonId, session, m) {
   const sock = session.sock;
-  // Ignora as nossas próprias mensagens e grupos
+  // Ignora as nossas próprias mensagens, grupos, canais/newsletters, broadcasts e status.
+  // Só respondemos a conversas pessoais 1:1 (clientes reais).
   if (m.key.fromMe) return;
-  if (m.key.remoteJid?.endsWith("@g.us")) return;
+  const jid = m.key.remoteJid || "";
+  if (
+    jid.endsWith("@g.us") ||         // grupos
+    jid.endsWith("@newsletter") ||   // canais
+    jid.endsWith("@broadcast") ||    // listas de difusão / status
+    jid === "status@broadcast"
+  ) return;
 
   const text =
     m.message?.conversation ||
