@@ -471,6 +471,23 @@ app.post("/send", async (req, res) => {
   }
 });
 
+/** Fixa/desafixa uma conversa no WhatsApp da gestora (para ver de caras). */
+app.post("/pin", async (req, res) => {
+  const { salonId = "default", to, pin = true } = req.body || {};
+  const session = sessions.get(salonId);
+  if (!session || session.status !== "open") {
+    return res.status(400).json({ ok: false, error: "not_connected" });
+  }
+  try {
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    await session.sock.chatModify({ pin: !!pin }, jid);
+    res.json({ ok: true });
+  } catch (e) {
+    // Limite de 3 fixados do WhatsApp ou store sem o chat → falha controlada.
+    res.status(200).json({ ok: false, error: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────────────────
 // Boot — restaura sessões já autenticadas
 // ─────────────────────────────────────────────────────────
