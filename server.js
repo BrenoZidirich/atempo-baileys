@@ -69,7 +69,7 @@ async function startSession(salonId) {
     printQRInTerminal: false,
     logger: pino({ level: "silent" }),
     browser: ["ATEMPO", "Chrome", "1.0"],
-    syncFullHistory: false,
+    syncFullHistory: true,
     markOnlineOnConnect: false,
   });
 
@@ -122,6 +122,56 @@ async function startSession(salonId) {
         // Logged out — limpa credenciais para forçar novo QR
         fs.rmSync(sessionDir, { recursive: true, force: true });
       }
+    }
+  });
+
+  sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
+    try {
+      if (!messages || messages.length === 0) return;
+      log.info(`[${salonId}] 📚 Histórico de mensagens recebido (${messages.length} mensagens)`);
+      const ownerTexts = [];
+      // Reverter as mensagens para ficarem em ordem cronológica (mais antiga para mais recente)
+      // pois o WhatsApp envia em ordem reversa (mais recente primeiro)
+      const sortedMessages = messages.slice().reverse();
+      for (const m of sortedMessages) {
+        if (m.key.fromMe) {
+          // Filtrar mensagens enviadas pelo próprio bot (seus IDs conhecidos nesta sessão)
+          if (m.key.id && session.botSentIds.has(m.key.id)) {
+            continue;
+          }
+          const text =
+            m.message?.conversation ||
+            m.message?.extendedTextMessage?.text ||
+            null;
+          if (text && text.trim().length >= 3 && text.trim().length <= 600) {
+            ownerTexts.push(text.trim());
+          }
+        }
+      }
+
+      if (ownerTexts.length === 0) return;
+
+      log.info(`[${salonId}] 📚 Enviando ${ownerTexts.length} mensagens históricas para análise de voz...`);
+      const headers = { "Content-Type": "application/json" };
+      if (INTERNAL_KEY) headers["X-Internal-Key"] = INTERNAL_KEY;
+      
+      const res = await fetch(`${ATEMPO_URL}/v1/messages/outgoing/bulk`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          salonId,
+          messages: ownerTexts,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        log.info(`[${salonId}] 📚 Sincronizadas ${data.added} novas mensagens de histórico (Total no buffer: ${data.count})`);
+      } else {
+        log.error(`[${salonId}] 📚 Erro ao enviar lote de histórico: status ${res.status}`);
+      }
+    } catch (e) {
+      log.error({ err: e.message }, `[${salonId}] history sync handling failed`);
     }
   });
 
@@ -185,12 +235,28 @@ async function handleIncoming(salonId, session, m) {
     }
   }
 
-  if ((!text || !text.trim()) && !audioBase64) return;  // nada de útil
+  // Imagem (ex.: comprovativo de pagamento): descarrega para o ATEMPO ler com visão.
+  let imageBase64 = null, imageMime = null;
+  const imgMsg = m.message?.imageMessage;
+  if (imgMsg) {
+    try {
+      const stream = await downloadContentFromMessage(imgMsg, "image");
+      let buf = Buffer.from([]);
+      for await (const chunk of stream) buf = Buffer.concat([buf, chunk]);
+      imageBase64 = buf.toString("base64");
+      imageMime = imgMsg.mimetype || "image/jpeg";
+      log.info(`[${salonId}] 🖼️ imagem recebida (${buf.length} bytes)`);
+    } catch (e) {
+      log.warn(`[${salonId}] falha a descarregar imagem: ${e.message}`);
+    }
+  }
+
+  if ((!text || !text.trim()) && !audioBase64 && !imageBase64) return;  // nada de útil
 
   const remoteJid = m.key.remoteJid;
   const contactName = m.pushName || remoteJid.split("@")[0];
 
-  log.info(`[${salonId}] 📨 ${contactName}: ${text || "[áudio]"}`);
+  log.info(`[${salonId}] 📨 ${contactName}: ${text || (imageBase64 ? "[imagem]" : "[áudio]")}`);
 
   // Indicador "a escrever..." enquanto a IA pensa — toque humano
   try { await sock.sendPresenceUpdate("composing", remoteJid); } catch {}
@@ -207,6 +273,8 @@ async function handleIncoming(salonId, session, m) {
       text: text || "",
       audioBase64,
       audioMime,
+      imageBase64,
+      imageMime,
       timestamp: Math.floor(Date.now() / 1000),
     }),
   });
@@ -265,7 +333,15 @@ async function handleIncoming(salonId, session, m) {
 // ─────────────────────────────────────────────────────────
 
 async function handleOwnerOutgoing(salonId, session, m) {
-  if (m.key.remoteJid?.endsWith("@g.us")) return;  // ignora grupos
+  const remoteJid = m.key.remoteJid || "";
+  if (remoteJid.endsWith("@g.us")) return;  // ignora grupos
+  
+  // Ignora mensagens enviadas para si próprio
+  const me = session.sock.user?.id || "";
+  const myNum = me.split(":")[0].split("@")[0];
+  const targetNum = remoteJid.split("@")[0];
+  if (myNum && targetNum === myNum) return;
+
   const id = m.key.id;
   if (id && session.botSentIds.has(id)) {           // foi o bot, não o dono
     session.botSentIds.delete(id);
@@ -287,6 +363,7 @@ async function handleOwnerOutgoing(salonId, session, m) {
         salonId,
         text: text.trim(),
         contactName: m.pushName || "",
+        contactJid: remoteJid,
         timestamp: Math.floor(Date.now() / 1000),
       }),
     });
