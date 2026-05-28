@@ -464,8 +464,53 @@ app.post("/send", async (req, res) => {
     } else {
       jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
     }
-    await session.sock.sendMessage(jid, { text });
-    res.json({ ok: true });
+    const sent = await session.sock.sendMessage(jid, { text });
+    // Tracking: guarda key para podermos revogar depois ("delete for everyone")
+    if (sent?.key?.id) {
+      session.botSentIds.add(sent.key.id);
+      if (session.botSentIds.size > 500) session.botSentIds.clear();
+      session.recentSent = session.recentSent || new Map();
+      const arr = session.recentSent.get(jid) || [];
+      arr.push({ key: sent.key, text, at: Date.now() });
+      if (arr.length > 20) arr.shift();
+      session.recentSent.set(jid, arr);
+    }
+    res.json({ ok: true, key: sent?.key || null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** Revoga a última mensagem enviada para um destinatário (delete for everyone).
+ *  Funciona se a mensagem foi enviada via /send (precisamos da key trackeada).
+ *  WhatsApp permite revogar até ~2 dias após o envio. */
+app.post("/revoke-last", async (req, res) => {
+  const { salonId = "default", to, matchText } = req.body || {};
+  const session = sessions.get(salonId);
+  if (!session || session.status !== "open") {
+    return res.status(400).json({ ok: false, error: "not_connected" });
+  }
+  try {
+    const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+    const arr = session.recentSent?.get(jid);
+    if (!arr || arr.length === 0) {
+      return res.status(404).json({ ok: false, error: "no_tracked_messages",
+        hint: "Esta mensagem provavelmente foi enviada antes do tracking ser activado. Reenvia para haver key." });
+    }
+    // Encontrar a entrada certa: por matchText (substring) se fornecido, senão a mais recente
+    let entry = null;
+    if (matchText) {
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if ((arr[i].text || "").includes(matchText)) { entry = arr[i]; break; }
+      }
+    }
+    if (!entry) entry = arr[arr.length - 1];
+    await session.sock.sendMessage(jid, { delete: entry.key });
+    // remove do tracking
+    const idx = arr.indexOf(entry);
+    if (idx >= 0) arr.splice(idx, 1);
+    log.info(`[${salonId}] 🗑️  revogada msg ${entry.key.id} para ${jid}`);
+    res.json({ ok: true, revoked: entry.key });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
