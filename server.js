@@ -192,6 +192,37 @@ async function startSession(salonId) {
     }
   });
 
+  // ─────────────────────────────────────────────────────────
+  // Chamada de voz do WhatsApp: a IA não consegue atender áudio
+  // (limite do WhatsApp/Meta). Recusamos com elegância e abrimos
+  // logo a conversa por mensagem, para o cliente continuar por texto.
+  // ─────────────────────────────────────────────────────────
+  const callReplied = session._callReplied || (session._callReplied = new Map());
+  sock.ev.on("call", async (calls) => {
+    for (const c of (calls || [])) {
+      try {
+        if (c.status !== "offer") continue;          // só a chamada a entrar
+        const from = c.from;
+        if (!from || from.endsWith("@g.us")) continue; // ignora grupos
+        // 1) recusa a chamada
+        try { await sock.rejectCall(c.id, from); }
+        catch (e) { log.warn(`[${salonId}] rejectCall falhou: ${e.message}`); }
+        // 2) anti-spam: no máx 1 mensagem por contacto a cada 90s
+        const now = Date.now();
+        if (now - (callReplied.get(from) || 0) < 90000) continue;
+        callReplied.set(from, now);
+        // 3) mensagem automática que abre a conversa por texto
+        const text =
+          "Olá! 😊 Vi que tentou ligar por aqui. Não consigo atender chamadas " +
+          "pelo WhatsApp, mas respondo-lhe já por mensagem — em que posso ajudar?";
+        await sock.sendMessage(from, { text });
+        log.info(`[${salonId}] 📞➡️💬 chamada WhatsApp recusada + mensagem enviada a ${from}`);
+      } catch (e) {
+        log.error({ err: e.message }, `[${salonId}] tratamento de chamada falhou`);
+      }
+    }
+  });
+
   return session;
 }
 
@@ -448,7 +479,7 @@ app.post("/logout", async (req, res) => {
 
 /** Envia mensagem manualmente (útil para o dashboard fazer takeover). */
 app.post("/send", async (req, res) => {
-  const { salonId = "default", to, text } = req.body || {};
+  const { salonId = "default", to, text, audioBase64 } = req.body || {};
   const session = sessions.get(salonId);
   if (!session || session.status !== "open") {
     return res.status(400).json({ ok: false, error: "not_connected" });
@@ -464,7 +495,17 @@ app.post("/send", async (req, res) => {
     } else {
       jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
     }
-    const sent = await session.sock.sendMessage(jid, { text });
+    let sent;
+    if (audioBase64) {
+      // Envia como nota de voz (ptt) — para briefings diários, comandos respondidos por voz, etc.
+      const audioBuf = Buffer.from(audioBase64, "base64");
+      sent = await session.sock.sendMessage(jid, {
+        audio: audioBuf, ptt: true, mimetype: "audio/ogg; codecs=opus",
+      });
+      log.info(`[${salonId}] 🔊 áudio enviado (${audioBuf.length} bytes) para ${jid.slice(0, 25)}`);
+    } else {
+      sent = await session.sock.sendMessage(jid, { text });
+    }
     // Tracking: guarda key para podermos revogar depois ("delete for everyone")
     if (sent?.key?.id) {
       session.botSentIds.add(sent.key.id);
