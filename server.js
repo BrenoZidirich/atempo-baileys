@@ -146,6 +146,17 @@ async function startSession(salonId) {
       session.qrDataUrl = null;
       session.connectedAt = new Date().toISOString();
       log.info(`[${salonId}] ✅ ligado ao WhatsApp`);
+      // Força a sincronização da agenda (nomes de contactos guardados no
+      // telemóvel da dona). Sem isto, numa RECONEXÃO o WhatsApp não reenvia os
+      // contactos e a deteção de "(PESSOAL)" ficaria vazia. resyncAppState puxa
+      // as alterações de contactos via app-state → dispara contacts.upsert/update.
+      try {
+        await sock.resyncAppState(
+          ["critical_unblock_low", "regular_high", "regular_low", "regular"], false);
+        log.info(`[${salonId}] 🔄 resync de contactos pedido (deteção de PESSOAL)`);
+      } catch (e) {
+        log.warn(`[${salonId}] resync de contactos falhou: ${e.message}`);
+      }
     }
 
     if (connection === "close") {
