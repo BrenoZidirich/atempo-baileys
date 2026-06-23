@@ -82,10 +82,51 @@ async function startSession(salonId) {
     // IDs de mensagens que o BOT enviou — para não as confundir com a voz do
     // dono quando reaparecem em messages.upsert como fromMe.
     botSentIds: new Set(),
+    // JIDs de contactos que a dona marcou como PESSOAL na agenda do telemóvel
+    // (nome do contacto contém "pessoal"). A IA NUNCA responde a estes.
+    personalJids: new Set(),
   };
   sessions.set(salonId, session);
 
   sock.ev.on("creds.update", saveCreds);
+
+  // ─────────────────────────────────────────────────────────
+  // Contactos pessoais: a dona marca um contacto como "(PESSOAL)" no nome
+  // (na agenda do telemóvel). O WhatsApp sincroniza esse nome guardado
+  // (campo `name`/`verifiedName`, distinto do pushName/`notify`). Se contiver
+  // "pessoal", desligamos a IA SÓ para esse contacto — fica em silêncio.
+  // ─────────────────────────────────────────────────────────
+  const isPersonalContactName = (c) => {
+    const saved = (c?.name || c?.verifiedName || "").toLowerCase();
+    return /\bpessoal\b/.test(saved) || saved.includes("(pessoal)");
+  };
+  const ingestContacts = (contacts, label) => {
+    if (!Array.isArray(contacts)) return;
+    let marked = 0;
+    for (const c of contacts) {
+      // Preferimos o JID em formato número (@s.whatsapp.net) — é o que chega
+      // como remoteJid nas mensagens. Aceitamos também o id directo.
+      const ids = [c?.jid, c?.id].filter(
+        (x) => typeof x === "string" && x.endsWith("@s.whatsapp.net")
+      );
+      if (ids.length === 0) continue;
+      // contacts.update vem parcial — se não traz `name`, não mexemos no estado.
+      if (label === "contacts.update" && c?.name === undefined && c?.verifiedName === undefined) continue;
+      if (isPersonalContactName(c)) {
+        for (const id of ids) {
+          if (!session.personalJids.has(id)) { session.personalJids.add(id); marked++; }
+        }
+      } else {
+        for (const id of ids) session.personalJids.delete(id);
+      }
+    }
+    if (marked > 0) {
+      log.info(`[${salonId}] 🔒 ${marked} contacto(s) marcado(s) PESSOAL via ${label} (total: ${session.personalJids.size}) — IA desligada nesses`);
+    }
+  };
+  sock.ev.on("contacts.set", ({ contacts }) => ingestContacts(contacts, "contacts.set"));
+  sock.ev.on("contacts.upsert", (contacts) => ingestContacts(contacts, "contacts.upsert"));
+  sock.ev.on("contacts.update", (updates) => ingestContacts(updates, "contacts.update"));
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -127,6 +168,7 @@ async function startSession(salonId) {
 
   sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
     try {
+      ingestContacts(contacts, "history.set");
       if (!messages || messages.length === 0) return;
       log.info(`[${salonId}] 📚 Histórico de mensagens recebido (${messages.length} mensagens)`);
       const ownerTexts = [];
@@ -242,6 +284,12 @@ async function handleIncoming(salonId, session, m) {
     jid.endsWith("@broadcast") ||    // listas de difusão / status
     jid === "status@broadcast"
   ) return;
+
+  // Contacto marcado como PESSOAL na agenda da dona → IA fica em silêncio.
+  if (session.personalJids && session.personalJids.has(jid)) {
+    log.info(`[${salonId}] 🔒 ignorado (contacto PESSOAL): ${jid}`);
+    return;
+  }
 
   const text =
     m.message?.conversation ||
@@ -366,6 +414,9 @@ async function handleIncoming(salonId, session, m) {
 async function handleOwnerOutgoing(salonId, session, m) {
   const remoteJid = m.key.remoteJid || "";
   if (remoteJid.endsWith("@g.us")) return;  // ignora grupos
+  // Não aprender a "voz" a partir de conversas com contactos PESSOAIS — são
+  // privadas e não representam o tom de atendimento.
+  if (session.personalJids && session.personalJids.has(remoteJid)) return;
   
   // Ignora mensagens enviadas para si próprio
   const me = session.sock.user?.id || "";
